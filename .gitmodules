@@ -1,0 +1,7 @@
+[submodule "mixllm/kernels/cutlass"]
+	path = mixllm/kernels/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+	branch = v4.0.0
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/vllm-project/vllm.git

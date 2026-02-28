@@ -1,0 +1,112 @@
+From e3ddffb715f51636040f95249df1d2ee218915ab Mon Sep 17 00:00:00 2001
+From: xiaonans <sxnzxz@gmail.com>
+Date: Tue, 8 Jul 2025 08:23:50 +0000
+Subject: [PATCH 2/4] Workaround W4.4A8 gsm8k fail when not eager_mode
+
+---
+ run_benchmark.sh                              |  2 +-
+ run_gsm8k.sh                                  | 51 +++++++++++--------
+ .../layers/quantization/mixllm.py               |  6 ++-
+ 3 files changed, 36 insertions(+), 23 deletions(-)
+
+diff --git a/run_benchmark.sh b/run_benchmark.sh
+index 4470d2e30..372e6edaf 100755
+--- a/run_benchmark.sh
++++ b/run_benchmark.sh
+@@ -6,7 +6,7 @@ MODEL_PATH_Qwen_W16A16="Qwen/Qwen2.5-7B"
+ 
+ INPUT_LENS=(100 1000 5000)
+ OUTPUT_LENS=(1 100 1000 2000)
+-BATCH_SIZES=(2 4 8 16 32 64 128)
++BATCH_SIZES=(1 2 4 8 16 32 64 128)
+ 
+ OUTPUT_FILE="latency_qwen7b_W8A8.csv"
+ echo "batch_size,input_len,output_len,mixllm_W8A8,W16A16,speedup" > "$OUTPUT_FILE"
+diff --git a/run_gsm8k.sh b/run_gsm8k.sh
+index c31364870..52614bbf0 100755
+--- a/run_gsm8k.sh
++++ b/run_gsm8k.sh
+@@ -1,31 +1,42 @@
+ # 参数变量定义
+-MODEL_W16A16="Qwen/Qwen2.5-7B"
+-MODEL_W8A8="../quantized_model/Qwen/Qwen2.5-7B/1.0/"
+-MODEL_W44A8="../quantized_model/Qwen/Qwen2.5-7B/0.1/"
+-MODEL_W4A8="../quantized_model/Qwen/Qwen2.5-7B/0/"
+-MODEL_W16A16_15B="Qwen/Qwen2.5-1.5B"
++MODELS=(
++    "Qwen/Qwen2.5-7B"
++    "../quantized_model/Qwen/Qwen2.5-7B/1.0"
++    "../quantized_model/Qwen/Qwen2.5-7B/0.1"
++    "../quantized_model/Qwen/Qwen2.5-7B/0"
++    "Qwen/Qwen2.5-1.5B"
++)
++
++# MODELS=(
++#     "../quantized_model/Qwen/Qwen2.5-7B/0.1"
++# )
++
+ ADD_BOS_TOKEN=true
+ MAX_NUM_SEQS=512
+ TASKS="gsm8k"
+ NUM_FEWSHOT=5
+ LIMIT=250
+-BATCH_SIZE=32
+-LOG_FILE="gsm8k_eval.log"
+ CSV_FILE="gsm8k_result.csv"
++BATCH_SIZES=(256 128 64 32 16 8 4 2 1)
++
++echo "model,batch_size,flexible-extract,strict-match" > $CSV_FILE
++
++for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
++    for MODEL in "${MODELS[@]}"; do
++        MODEL_NAME=$(echo "$MODEL" | sed 's|^\.\./quantized_model/||' | sed 's/[\/\.]/_/g')
++        LOG_FILE="gsm8k_eval_${MODEL_NAME}_bs${BATCH_SIZE}.log"
+ 
+-# 写入表头
+-echo "model,flexible-extract,strict-match" > $CSV_FILE
++        if [[ "$MODEL" == *"/0.1"* ]]; then
++            MODEL_ARGS="pretrained=$MODEL,add_bos_token=$ADD_BOS_TOKEN,max_num_seqs=$MAX_NUM_SEQS,enforce_eager=True"
++        else
++            MODEL_ARGS="pretrained=$MODEL,add_bos_token=$ADD_BOS_TOKEN,max_num_seqs=$MAX_NUM_SEQS"
++        fi
+ 
+-for MODEL in \
+-    "$MODEL_W16A16" \
+-    "$MODEL_W8A8" \
+-    "$MODEL_W44A8" \
+-    "$MODEL_W4A8" \
+-    "$MODEL_W16A16_15B"
+-do
+-    lm_eval --model vllm --model_args pretrained=$MODEL,add_bos_token=$ADD_BOS_TOKEN,max_num_seqs=$MAX_NUM_SEQS --tasks $TASKS --num_fewshot $NUM_FEWSHOT --limit $LIMIT --batch_size $BATCH_SIZE > $LOG_FILE 2>&1
++        lm_eval --model vllm --model_args $MODEL_ARGS \
++            --tasks $TASKS --num_fewshot $NUM_FEWSHOT --limit $LIMIT --batch_size $BATCH_SIZE > $LOG_FILE 2>&1
+ 
+-    FLEXIBLE=$(awk -F'|' '/\|gsm8k\|/ {gsub(/^[ \t]+|[ \t]+$/, "", $7); print $8}' $LOG_FILE)
+-    STRICT=$(awk -F'|' '/\|     \|/ {gsub(/^[ \t]+|[ \t]+$/, "", $8); print $8}' $LOG_FILE)
+-    echo "$MODEL,$FLEXIBLE,$STRICT" >> $CSV_FILE
++        FLEXIBLE=$(awk -F'|' '/\|gsm8k\|/ {gsub(/^[ \t]+|[ \t]+$/, "", $7); print $8}' $LOG_FILE)
++        STRICT=$(awk -F'|' '/\|     \|/ {gsub(/^[ \t]+|[ \t]+$/, "", $8); print $8}' $LOG_FILE)
++        echo "$MODEL,$BATCH_SIZE,$FLEXIBLE,$STRICT" >> $CSV_FILE
++    done
+ done
+diff --git a/vllm/model_executor/layers/quantization/mixllm.py b/vllm/model_executor/layers/quantization/mixllm.py
+index 8c6e7ab83..a4e30593f 100644
+--- a/vllm/model_executor/layers/quantization/mixllm.py
++++ b/vllm/model_executor/layers/quantization/mixllm.py
+@@ -148,7 +148,9 @@ class MixLLMLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+-        output = self.lmixllm.forward(x)
++        out_shape = x.shape[:-1] + (sum(layer.output_partition_sizes), )
++        reshaped_x = x.reshape(-1, x.shape[-1])
++        output = self.lmixllm.forward(reshaped_x)
+         if bias is not None:
+             output.add_(bias)
+-        return output
+\ No newline at end of file
++        return output.reshape(out_shape)
+\ No newline at end of file
+-- 
+2.34.1
+

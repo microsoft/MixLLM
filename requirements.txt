@@ -1,0 +1,8 @@
+torch
+transformers
+tqdm
+numpy
+flash-attn
+datasets
+sentencepiece
+lm-eval

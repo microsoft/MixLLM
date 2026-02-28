@@ -1,0 +1,54 @@
+repos:
+-   repo: meta
+    hooks:
+    -   id: check-hooks-apply
+    -   id: check-useless-excludes
+
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.0.1
+    hooks:
+    -   id: check-case-conflict
+    # -   id: check-json
+    # -   id: check-symlinks
+    -   id: check-yaml
+    -   id: destroyed-symlinks
+    -   id: end-of-file-fixer
+        # exclude:
+    -   id: fix-byte-order-marker
+    -   id: fix-encoding-pragma
+        args: [--remove]
+    -   id: mixed-line-ending
+        args: [--fix=lf]
+    # -   id: requirements-txt-fixer
+    -   id: trailing-whitespace
+
+-   repo: https://github.com/google/yapf
+    rev: v0.32.0
+    hooks:
+    -   id: yapf
+
+-   repo: https://gitlab.com/daverona/pre-commit/cpp
+    rev: 0.8.0
+    hooks:
+    -   id: clang-format  # formatter of C/C++ code based on a style guide: LLVM, Google, Chromium, Mozilla, and WebKit available
+        args: []
+
+# TODO: add licence checker
+
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.1.0
+    hooks:
+    -   id: codespell
+        args: [
+            '--skip=',
+            '--ignore-regex=\\n',  # Do not count the 'n' in an escaped newline as part of a word
+            '--ignore-words-list=',  # Word used in error messages that need rewording
+            --check-filenames,
+            --check-hidden
+        ]
+
+-   repo: https://github.com/pycqa/flake8
+    rev: 4.0.1
+    hooks:
+    -   id: flake8
+        args: ['--config=.flake8']

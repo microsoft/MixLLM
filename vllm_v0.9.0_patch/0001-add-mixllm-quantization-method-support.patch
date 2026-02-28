@@ -1,0 +1,366 @@
+From a3050ad92d858dd92a6edd39448b05f77e8bf115 Mon Sep 17 00:00:00 2001
+From: xiaonans <sxnzxz@gmail.com>
+Date: Mon, 16 Jun 2025 02:39:05 +0000
+Subject: [PATCH 1/4] add mixllm quantization method support
+
+---
+ run_benchmark.sh                              |  59 +++++++
+ run_gsm8k.sh                                  |  31 ++++
+ .../layers/quantization/__init__.py           |   3 +
+ .../layers/quantization/mixllm.py               | 154 ++++++++++++++++++
+ xn_quant_sample.py                            |  48 ++++++
+ 5 files changed, 295 insertions(+)
+ create mode 100755 run_benchmark.sh
+ create mode 100755 run_gsm8k.sh
+ create mode 100644 vllm/model_executor/layers/quantization/mixllm.py
+ create mode 100644 xn_quant_sample.py
+
+diff --git a/run_benchmark.sh b/run_benchmark.sh
+new file mode 100755
+index 000000000..4470d2e30
+--- /dev/null
++++ b/run_benchmark.sh
+@@ -0,0 +1,59 @@
++#!/bin/bash
++# filepath: /home/dlisuser/xnsong/vllm/run_benchmark.sh
++
++MODEL_PATH_MIXLLM_W8A8="../quantized_model/Qwen/Qwen2.5-7B/1.0/"
++MODEL_PATH_Qwen_W16A16="Qwen/Qwen2.5-7B"
++
++INPUT_LENS=(100 1000 5000)
++OUTPUT_LENS=(1 100 1000 2000)
++BATCH_SIZES=(2 4 8 16 32 64 128)
++
++OUTPUT_FILE="latency_qwen7b_W8A8.csv"
++echo "batch_size,input_len,output_len,mixllm_W8A8,W16A16,speedup" > "$OUTPUT_FILE"
++
++rm -f latency_raw.log
++
++for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
++  for INPUT_LEN in "${INPUT_LENS[@]}"; do
++    for OUTPUT_LEN in "${OUTPUT_LENS[@]}"; do
++      echo "Running: batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN"
++      if [ -n "$MODEL_PATH_MIXLLM_W8A8" ]; then
++        RESULT=$(python benchmarks/benchmark_latency.py \
++          --model "$MODEL_PATH_MIXLLM_W8A8" \
++          --num-iters-warmup 2 \
++          --num-iters 10 \
++          --input-len "$INPUT_LEN" \
++          --output-len "$OUTPUT_LEN" \
++          --batch-size "$BATCH_SIZE" 2>&1)
++        echo "==== MIXLLM_W8A8 batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
++        echo "$RESULT" >> latency_raw.log
++        LATENCY_MIXLLM_W8A8=$(echo "$RESULT" | grep "Avg latency" | awk '{print $(NF-1)}')
++      else
++        LATENCY_MIXLLM_W8A8=""
++      fi
++
++      if [ -n "$MODEL_PATH_Qwen_W16A16" ]; then
++        RESULT=$(python benchmarks/benchmark_latency.py \
++          --model "$MODEL_PATH_Qwen_W16A16" \
++          --num-iters-warmup 2 \
++          --num-iters 10 \
++          --input-len "$INPUT_LEN" \
++          --output-len "$OUTPUT_LEN" \
++          --batch-size "$BATCH_SIZE" 2>&1)
++        echo "==== QWEN_W16A16 batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
++        echo "$RESULT" >> latency_raw.log
++        LATENCY_QWEN_W16A16=$(echo "$RESULT" | grep "Avg latency" | awk '{print $(NF-1)}')
++      else
++        LATENCY_QWEN_W16A16=""
++      fi
++
++      if [ -n "$LATENCY_MIXLLM_W8A8" ] && [ -n "$LATENCY_QWEN_W16A16" ]; then
++        SPEEDUP=$(awk "BEGIN {if ($LATENCY_MIXLLM_W8A8==0) print \"NaN\"; else printf \"%.2fx\", $LATENCY_QWEN_W16A16/$LATENCY_MIXLLM_W8A8}")
++      else
++        SPEEDUP=""
++      fi
++
++      echo "$BATCH_SIZE,$INPUT_LEN,$OUTPUT_LEN,$LATENCY_MIXLLM_W8A8,$LATENCY_QWEN_W16A16,$SPEEDUP" >> "$OUTPUT_FILE"
++    done
++  done
++done
+\ No newline at end of file
+diff --git a/run_gsm8k.sh b/run_gsm8k.sh
+new file mode 100755
+index 000000000..c31364870
+--- /dev/null
++++ b/run_gsm8k.sh
+@@ -0,0 +1,31 @@
++# 参数变量定义
++MODEL_W16A16="Qwen/Qwen2.5-7B"
++MODEL_W8A8="../quantized_model/Qwen/Qwen2.5-7B/1.0/"
++MODEL_W44A8="../quantized_model/Qwen/Qwen2.5-7B/0.1/"
++MODEL_W4A8="../quantized_model/Qwen/Qwen2.5-7B/0/"
++MODEL_W16A16_15B="Qwen/Qwen2.5-1.5B"
++ADD_BOS_TOKEN=true
++MAX_NUM_SEQS=512
++TASKS="gsm8k"
++NUM_FEWSHOT=5
++LIMIT=250
++BATCH_SIZE=32
++LOG_FILE="gsm8k_eval.log"
++CSV_FILE="gsm8k_result.csv"
++
++# 写入表头
++echo "model,flexible-extract,strict-match" > $CSV_FILE
++
++for MODEL in \
++    "$MODEL_W16A16" \
++    "$MODEL_W8A8" \
++    "$MODEL_W44A8" \
++    "$MODEL_W4A8" \
++    "$MODEL_W16A16_15B"
++do
++    lm_eval --model vllm --model_args pretrained=$MODEL,add_bos_token=$ADD_BOS_TOKEN,max_num_seqs=$MAX_NUM_SEQS --tasks $TASKS --num_fewshot $NUM_FEWSHOT --limit $LIMIT --batch_size $BATCH_SIZE > $LOG_FILE 2>&1
++
++    FLEXIBLE=$(awk -F'|' '/\|gsm8k\|/ {gsub(/^[ \t]+|[ \t]+$/, "", $7); print $8}' $LOG_FILE)
++    STRICT=$(awk -F'|' '/\|     \|/ {gsub(/^[ \t]+|[ \t]+$/, "", $8); print $8}' $LOG_FILE)
++    echo "$MODEL,$FLEXIBLE,$STRICT" >> $CSV_FILE
++done
+diff --git a/vllm/model_executor/layers/quantization/__init__.py b/vllm/model_executor/layers/quantization/__init__.py
+index 407b9c72f..bddaef53b 100644
+--- a/vllm/model_executor/layers/quantization/__init__.py
++++ b/vllm/model_executor/layers/quantization/__init__.py
+@@ -26,6 +26,7 @@ QuantizationMethods = Literal[
+     "compressed-tensors",
+     "bitsandbytes",
+     "qqq",
++    "mixllm",
+     "hqq",
+     "experts_int8",
+     "neuron_quant",
+@@ -109,6 +110,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
+     from .neuron_quant import NeuronQuantConfig
+     from .ptpc_fp8 import PTPCFp8Config
+     from .qqq import QQQConfig
++    from .mixllm import MixLLMConfig
+     from .torchao import TorchAOConfig
+     from .tpu_int8 import Int8TpuConfig
+ 
+@@ -133,6 +135,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
+         "bitsandbytes": BitsAndBytesConfig,
+         "ptpc_fp8": PTPCFp8Config,
+         "qqq": QQQConfig,
++        "mixllm": MixLLMConfig,
+         "hqq": HQQMarlinConfig,
+         "experts_int8": ExpertsInt8Config,
+         "neuron_quant": NeuronQuantConfig,
+diff --git a/vllm/model_executor/layers/quantization/mixllm.py b/vllm/model_executor/layers/quantization/mixllm.py
+new file mode 100644
+index 000000000..8c6e7ab83
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/mixllm.py
+@@ -0,0 +1,154 @@
++from typing import Any, Dict, List, Optional
++
++import torch
++from torch.nn.parameter import Parameter
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
++from vllm.model_executor.layers.quantization.base_config import (
++    QuantizationConfig)
++from vllm.model_executor.utils import set_weight_attrs
++import torch.nn.functional as F
++from pymixllm.utils import bcolors, weight_quantize
++from pymixllm import LinearMixLLM
++
++logger = init_logger(__name__)
++
++class MixLLMConfig(QuantizationConfig):
++    """Config class for MixLLM
++    
++    Reference: 
++    """
++
++    def __init__(
++        self,
++        ratio,
++    ) -> None:
++        self.ratio = ratio
++
++    def __repr__(self) -> str:
++        return "MixLLMConfig(ratio={})".format(
++            self.ratio)
++
++    @classmethod
++    def get_name(cls) -> str:
++        return "mixllm"
++
++    @classmethod
++    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
++        return [torch.half]
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 80
++
++    @classmethod
++    def get_config_filenames(cls) -> List[str]:
++        """List of filenames to search for in the model directory."""
++        return [
++            "quant_config.json",
++            "quantize_config.json",
++        ]
++
++    @classmethod
++    def from_config(cls, config: Dict[str, Any]) -> "MixLLMConfig":
++        ratio = cls.get_from_keys(config, ["ratio"])
++        return cls(ratio)
++
++    def get_quant_method(self, layer: torch.nn.Module,
++                         prefix: str) -> Optional["MixLLMLinearMethod"]:
++        if isinstance(layer, LinearBase):
++            return MixLLMLinearMethod(self)
++        return None
++
++
++class MixLLMLinearMethod(LinearMethodBase):
++    """Linear method for MixLLM.
++
++    Args:
++        quant_config: The MixLLM quantization config.
++    """
++    lmixllm: LinearMixLLM
++
++    def __init__(self, quant_config: MixLLMConfig):
++        self.quant_config = quant_config
++
++    def create_weights(
++            self, layer: torch.nn.Module,
++            input_size_per_partition: int,
++            output_partition_sizes: List[int], input_size: int,
++            output_size: int, params_dtype: torch.dtype,
++            **extra_weight_attrs
++    ):        
++        qweight = Parameter(torch.empty(sum(output_partition_sizes),
++                                       input_size_per_partition,
++                                       dtype=torch.int8),
++                           requires_grad=False)
++        scale = Parameter(torch.empty(qweight.shape[1]//128, sum(output_partition_sizes), dtype=torch.float16), requires_grad=False)
++        zero = Parameter(torch.empty(qweight.shape[1]//128, sum(output_partition_sizes), dtype=torch.uint8), requires_grad=False)
++        indices = Parameter(torch.empty(sum(output_partition_sizes), dtype=torch.int32), requires_grad=False)
++        is_int8_channel = Parameter(torch.empty(sum(output_partition_sizes), dtype=torch.bool), requires_grad=False)
++
++        layer.register_parameter("qweight", qweight)
++        layer.register_parameter("scale", scale)
++        layer.register_parameter("zero", zero)
++        layer.register_parameter("indices", indices)
++        layer.register_parameter("is_int8_channel", is_int8_channel)
++
++        set_weight_attrs(qweight, {"input_dim": 1, "output_dim": 0})
++        set_weight_attrs(qweight, extra_weight_attrs)
++        set_weight_attrs(scale, extra_weight_attrs)
++        set_weight_attrs(scale, {"input_dim": 0, "output_dim": 1})
++        set_weight_attrs(zero, extra_weight_attrs)
++        set_weight_attrs(zero, {"input_dim": 0, "output_dim": 1})
++        set_weight_attrs(indices, extra_weight_attrs)
++        set_weight_attrs(indices, {"input_dim": 0, "output_dim": 0})
++        set_weight_attrs(is_int8_channel, extra_weight_attrs)
++        set_weight_attrs(is_int8_channel, {"input_dim": 0, "output_dim": 0})
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if hasattr(layer, 'output_partition_sizes'):
++            idx = 0
++            for i in layer.output_partition_sizes:
++                idx += i
++                layer.indices[idx:] += i
++        is_int8_channel = layer.is_int8_channel
++        is_int4_channel = layer.is_int8_channel.logical_not()
++
++        weight_int8 = layer.qweight[is_int8_channel,:].contiguous()
++        weight_int4 = layer.qweight[is_int4_channel,:].contiguous()
++        del layer.qweight
++
++        weight_scale_int8 = layer.scale[:,is_int8_channel].contiguous()
++        weight_scale_int4 = layer.scale[:,is_int4_channel].contiguous()
++        del layer.scale
++
++        weight_zero_int4 = layer.zero[:,is_int4_channel].contiguous()
++        del layer.zero
++
++        indices_int8 = layer.indices[is_int8_channel].contiguous()
++        indices_int4 = layer.indices[is_int4_channel].contiguous()
++        del layer.indices
++        del layer.is_int8_channel
++        torch.cuda.empty_cache()
++        
++        self.lmixllm = LinearMixLLM(
++                 weight_int8 = weight_int8,
++                 weight_int4 = weight_int4,
++                 weight_scale_int8 = weight_scale_int8,
++                 weight_scale_int4 = weight_scale_int4,
++                 weight_zero_int4 = weight_zero_int4,
++                 indices_int8 = indices_int8,
++                 indices_int4 = indices_int4)
++
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        output = self.lmixllm.forward(x)
++        if bias is not None:
++            output.add_(bias)
++        return output
+\ No newline at end of file
+diff --git a/xn_quant_sample.py b/xn_quant_sample.py
+new file mode 100644
+index 000000000..2ca9dd8b1
+--- /dev/null
++++ b/xn_quant_sample.py
+@@ -0,0 +1,48 @@
++from vllm import LLM, SamplingParams
++import torch
++import os
++from vllm.model_executor.layers.quantization import get_quantization_config
++
++# os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllm_profile"
++
++# Sample prompts.
++prompts = [
++    "Hello, my name is",
++    "The president of the United States is",
++    "The capital of France is",
++    "The future of AI is",
++]
++# Create a sampling params object.
++sampling_params = SamplingParams(temperature=0, top_p=0.9, top_k=50, repetition_penalty=1.0)
++
++# Create an LLM.
++
++# mistralai/Mistral-7B-v0.1 #facebook/opt-125m  "../quantized_model/Mistral-7B-v0.1"  "Qwen/Qwen2.5-1.5B-Instruct" ../quantized_model/Qwen/Qwen2.5-1.5B/0.1/
++print("********************************* init *********************************") 
++# llm = LLM(model="Qwen/Qwen2.5-7B", enforce_eager=False)
++llm = LLM(model="../quantized_model/Qwen/Qwen2.5-7B/1.0/", enforce_eager=False)
++# llm = LLM(model="../quantized_model/mistralai/Mistral-7B-v0.3/0.1/", enforce_eager=False) 
++# llm = LLM(model="mistralai/Mistral-7B-v0.1", enforce_eager=False) 
++# llm = LLM(model="../quantized_model/Qwen/Qwen2.5-7B/1.0/", enforce_eager=False)
++
++
++# ../quantized_model/mistralai/Mistral-7B-v0.3/1.0/
++# llm = LLM(model="mistralai/Mistral-7B-v0.1", dtype=torch.float16, enforce_eager=False)
++# llm = LLM(model="TheBloke/Llama-2-7b-Chat-AWQ", quantization="qqq")
++# Generate texts from the prompts. The output is a list of RequestOutput objects
++# that contain the prompt, generated text, and other information.
++
++print("********************************* generate *****************************")
++torch.cuda.synchronize()
++torch.cuda.nvtx.range_push("llm.generate")
++# llm.start_profile()
++outputs = llm.generate(prompts, sampling_params)
++# llm.stop_profile()
++torch.cuda.synchronize()
++torch.cuda.nvtx.range_pop()
++
++# Print the outputs.
++for output in outputs:
++    prompt = output.prompt
++    generated_text = output.outputs[0].text
++    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+-- 
+2.34.1
+

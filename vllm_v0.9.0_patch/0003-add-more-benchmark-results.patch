@@ -1,0 +1,130 @@
+From 7ef523fddbed1c374f90efc9b31f504834b2a02b Mon Sep 17 00:00:00 2001
+From: xiaonans <sxnzxz@gmail.com>
+Date: Fri, 11 Jul 2025 02:22:31 +0000
+Subject: [PATCH 3/4] add more benchmark results
+
+---
+ run_benchmark.sh | 83 +++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 53 insertions(+), 30 deletions(-)
+
+diff --git a/run_benchmark.sh b/run_benchmark.sh
+index 372e6edaf..fba9bb0c5 100755
+--- a/run_benchmark.sh
++++ b/run_benchmark.sh
+@@ -1,15 +1,19 @@
+ #!/bin/bash
+ # filepath: /home/dlisuser/xnsong/vllm/run_benchmark.sh
+ 
+-MODEL_PATH_MIXLLM_W8A8="../quantized_model/Qwen/Qwen2.5-7B/1.0/"
+-MODEL_PATH_Qwen_W16A16="Qwen/Qwen2.5-7B"
++MODELS=(
++    "../quantized_model/Qwen/Qwen2.5-7B/0/"
++    "../quantized_model/Qwen/Qwen2.5-7B/0.1/"
++    "../quantized_model/Qwen/Qwen2.5-7B/1.0/"
++    "Qwen/Qwen2.5-7B"
++)
+ 
+ INPUT_LENS=(100 1000 5000)
+ OUTPUT_LENS=(1 100 1000 2000)
+ BATCH_SIZES=(1 2 4 8 16 32 64 128)
+ 
+ OUTPUT_FILE="latency_qwen7b_W8A8.csv"
+-echo "batch_size,input_len,output_len,mixllm_W8A8,W16A16,speedup" > "$OUTPUT_FILE"
++echo "batch_size,input_len,output_len,W4A8,W44A8,W8A8,W16A16,speedup_W4A8,speedup_W44A8,speedup_W8A8" > "$OUTPUT_FILE"
+ 
+ rm -f latency_raw.log
+ 
+@@ -17,43 +21,62 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
+   for INPUT_LEN in "${INPUT_LENS[@]}"; do
+     for OUTPUT_LEN in "${OUTPUT_LENS[@]}"; do
+       echo "Running: batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN"
+-      if [ -n "$MODEL_PATH_MIXLLM_W8A8" ]; then
+-        RESULT=$(python benchmarks/benchmark_latency.py \
+-          --model "$MODEL_PATH_MIXLLM_W8A8" \
+-          --num-iters-warmup 2 \
+-          --num-iters 10 \
+-          --input-len "$INPUT_LEN" \
+-          --output-len "$OUTPUT_LEN" \
+-          --batch-size "$BATCH_SIZE" 2>&1)
+-        echo "==== MIXLLM_W8A8 batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
++      
++      LATENCIES=()
++      for MODEL in "${MODELS[@]}"; do
++        # 如果是0.1路径的模型，则添加enforce_eager=True
++        if [[ "$MODEL" == *"/0.1"* ]]; then
++          RESULT=$(python benchmarks/benchmark_latency.py \
++            --model "$MODEL" \
++            --num-iters-warmup 2 \
++            --num-iters 10 \
++            --input-len "$INPUT_LEN" \
++            --output-len "$OUTPUT_LEN" \
++            --batch-size "$BATCH_SIZE" \
++            --enforce-eager 2>&1)
++        else
++          RESULT=$(python benchmarks/benchmark_latency.py \
++            --model "$MODEL" \
++            --num-iters-warmup 2 \
++            --num-iters 10 \
++            --input-len "$INPUT_LEN" \
++            --output-len "$OUTPUT_LEN" \
++            --batch-size "$BATCH_SIZE" 2>&1)
++        fi
++        
++        MODEL_NAME=$(echo "$MODEL" | sed 's|.*/||' | sed 's|/||g')
++        echo "==== $MODEL_NAME batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
+         echo "$RESULT" >> latency_raw.log
+-        LATENCY_MIXLLM_W8A8=$(echo "$RESULT" | grep "Avg latency" | awk '{print $(NF-1)}')
++        
++        LATENCY=$(echo "$RESULT" | grep "Avg latency" | awk '{print $(NF-1)}')
++        LATENCIES+=("$LATENCY")
++      done
++
++      LATENCY_W4A8=${LATENCIES[0]}
++      LATENCY_W44A8=${LATENCIES[1]}
++      LATENCY_W8A8=${LATENCIES[2]}
++      LATENCY_W16A16=${LATENCIES[3]}
++
++      # 计算加速比（相对于W16A16）
++      if [ -n "$LATENCY_W4A8" ] && [ -n "$LATENCY_W16A16" ]; then
++        SPEEDUP_W4A8=$(awk "BEGIN {if ($LATENCY_W4A8==0) print \"NaN\"; else printf \"%.2fx\", $LATENCY_W16A16/$LATENCY_W4A8}")
+       else
+-        LATENCY_MIXLLM_W8A8=""
++        SPEEDUP_W4A8=""
+       fi
+ 
+-      if [ -n "$MODEL_PATH_Qwen_W16A16" ]; then
+-        RESULT=$(python benchmarks/benchmark_latency.py \
+-          --model "$MODEL_PATH_Qwen_W16A16" \
+-          --num-iters-warmup 2 \
+-          --num-iters 10 \
+-          --input-len "$INPUT_LEN" \
+-          --output-len "$OUTPUT_LEN" \
+-          --batch-size "$BATCH_SIZE" 2>&1)
+-        echo "==== QWEN_W16A16 batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
+-        echo "$RESULT" >> latency_raw.log
+-        LATENCY_QWEN_W16A16=$(echo "$RESULT" | grep "Avg latency" | awk '{print $(NF-1)}')
++      if [ -n "$LATENCY_W44A8" ] && [ -n "$LATENCY_W16A16" ]; then
++        SPEEDUP_W44A8=$(awk "BEGIN {if ($LATENCY_W44A8==0) print \"NaN\"; else printf \"%.2fx\", $LATENCY_W16A16/$LATENCY_W44A8}")
+       else
+-        LATENCY_QWEN_W16A16=""
++        SPEEDUP_W44A8=""
+       fi
+ 
+-      if [ -n "$LATENCY_MIXLLM_W8A8" ] && [ -n "$LATENCY_QWEN_W16A16" ]; then
+-        SPEEDUP=$(awk "BEGIN {if ($LATENCY_MIXLLM_W8A8==0) print \"NaN\"; else printf \"%.2fx\", $LATENCY_QWEN_W16A16/$LATENCY_MIXLLM_W8A8}")
++      if [ -n "$LATENCY_W8A8" ] && [ -n "$LATENCY_W16A16" ]; then
++        SPEEDUP_W8A8=$(awk "BEGIN {if ($LATENCY_W8A8==0) print \"NaN\"; else printf \"%.2fx\", $LATENCY_W16A16/$LATENCY_W8A8}")
+       else
+-        SPEEDUP=""
++        SPEEDUP_W8A8=""
+       fi
+ 
+-      echo "$BATCH_SIZE,$INPUT_LEN,$OUTPUT_LEN,$LATENCY_MIXLLM_W8A8,$LATENCY_QWEN_W16A16,$SPEEDUP" >> "$OUTPUT_FILE"
++      echo "$BATCH_SIZE,$INPUT_LEN,$OUTPUT_LEN,$LATENCY_W4A8,$LATENCY_W44A8,$LATENCY_W8A8,$LATENCY_W16A16,$SPEEDUP_W4A8,$SPEEDUP_W44A8,$SPEEDUP_W8A8" >> "$OUTPUT_FILE"
+     done
+   done
+ done
+\ No newline at end of file
+-- 
+2.34.1
+

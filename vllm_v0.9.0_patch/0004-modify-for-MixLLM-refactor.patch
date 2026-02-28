@@ -1,0 +1,91 @@
+From ee55a770b11c99a23dbe9903d0c0af69876a529a Mon Sep 17 00:00:00 2001
+From: xiaonans <sxnzxz@gmail.com>
+Date: Wed, 16 Jul 2025 07:33:10 +0000
+Subject: [PATCH 4/4] modify for MixLLM refactor
+
+---
+ .gitignore                                      |  3 +++
+ run_benchmark.sh                                | 11 +++++------
+ run_gsm8k.sh                                    |  2 ++
+ vllm/model_executor/layers/quantization/mixllm.py |  3 +--
+ 4 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index e49d1d6ba..113c2d5c0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -202,3 +202,6 @@ shellcheck*/
+ 
+ # Ingore moe/marlin_moe gen code
+ csrc/moe/marlin_moe_wna16/kernel_*
++
++# Ignore gererated best configuration files for GEMM
++best_config/*
+diff --git a/run_benchmark.sh b/run_benchmark.sh
+index fba9bb0c5..8f11cb5ca 100755
+--- a/run_benchmark.sh
++++ b/run_benchmark.sh
+@@ -24,6 +24,9 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
+       
+       LATENCIES=()
+       for MODEL in "${MODELS[@]}"; do
++        MODEL_NAME=$(echo "$MODEL" | sed 's|.*/||' | sed 's|/||g')
++        echo "==== $MODEL_NAME batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
++        
+         # 如果是0.1路径的模型，则添加enforce_eager=True
+         if [[ "$MODEL" == *"/0.1"* ]]; then
+           RESULT=$(python benchmarks/benchmark_latency.py \
+@@ -33,7 +36,7 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
+             --input-len "$INPUT_LEN" \
+             --output-len "$OUTPUT_LEN" \
+             --batch-size "$BATCH_SIZE" \
+-            --enforce-eager 2>&1)
++            --enforce-eager 2>&1 | tee -a latency_raw.log)
+         else
+           RESULT=$(python benchmarks/benchmark_latency.py \
+             --model "$MODEL" \
+@@ -41,13 +44,9 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
+             --num-iters 10 \
+             --input-len "$INPUT_LEN" \
+             --output-len "$OUTPUT_LEN" \
+-            --batch-size "$BATCH_SIZE" 2>&1)
++            --batch-size "$BATCH_SIZE" 2>&1 | tee -a latency_raw.log)
+         fi
+         
+-        MODEL_NAME=$(echo "$MODEL" | sed 's|.*/||' | sed 's|/||g')
+-        echo "==== $MODEL_NAME batch-size=$BATCH_SIZE, input-len=$INPUT_LEN, output-len=$OUTPUT_LEN ====" >> latency_raw.log
+-        echo "$RESULT" >> latency_raw.log
+-        
+         LATENCY=$(echo "$RESULT" | grep "Avg latency" | awk '{print $(NF-1)}')
+         LATENCIES+=("$LATENCY")
+       done
+diff --git a/run_gsm8k.sh b/run_gsm8k.sh
+index 52614bbf0..cd74cc266 100755
+--- a/run_gsm8k.sh
++++ b/run_gsm8k.sh
+@@ -19,6 +19,8 @@ LIMIT=250
+ CSV_FILE="gsm8k_result.csv"
+ BATCH_SIZES=(256 128 64 32 16 8 4 2 1)
+ 
++export VLLM_WORKER_MULTIPROC_METHOD=spawn
++
+ echo "model,batch_size,flexible-extract,strict-match" > $CSV_FILE
+ 
+ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
+diff --git a/vllm/model_executor/layers/quantization/mixllm.py b/vllm/model_executor/layers/quantization/mixllm.py
+index a4e30593f..2470fcde4 100644
+--- a/vllm/model_executor/layers/quantization/mixllm.py
++++ b/vllm/model_executor/layers/quantization/mixllm.py
+@@ -9,8 +9,7 @@ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig)
+ from vllm.model_executor.utils import set_weight_attrs
+ import torch.nn.functional as F
+-from pymixllm.utils import bcolors, weight_quantize
+-from pymixllm import LinearMixLLM
++from mixllm.nn.modules.linear import LinearMixLLM
+ 
+ logger = init_logger(__name__)
+ 
+-- 
+2.34.1
+
