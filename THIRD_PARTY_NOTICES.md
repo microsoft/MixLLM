@@ -1,6 +1,6 @@
-# Third-Party Notices
+# NOTICES
 
-This project incorporates material from third-party software. The following notices are provided for informational purposes and to comply with applicable license requirements.
+This repository incorporates material as listed below or described in the code.
 
 ---
 
