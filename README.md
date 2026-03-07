@@ -14,6 +14,7 @@ This section guides you through installing the `mixllm` package and running basi
 ### Source Code Installation
 
 To get started with MixLLM, clone the repository and install the required dependencies.
+The installation will take several minutes.
 
 ```bash
 git clone --recursive https://github.com/microsoft/MixLLM.git
@@ -22,6 +23,17 @@ pip install -r requirements.txt
 
 pip install -e .
 ````
+
+You can optionally use the Dockerfile to build a Docker image before starting the installation.
+
+```bash
+docker build -t mixllm .
+docker run -it --name <container_name> --runtime nvidia --gpus all \
+    -v <host_path>:<container_path> \
+    --ipc=host \
+    mixllm \
+    bash
+```
 
 ### Running Kernel Tests
 
