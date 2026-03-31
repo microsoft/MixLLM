@@ -1,0 +1,13 @@
+////////////////////////////
+ 2024-12-23 02:08:25.650973 vllm performace test
+nvidia,12.4
+////////////////////////////
+ 2024-12-23 02:09:16.848309 vllm performace test
+nvidia,12.4
+engine_path:/workspace/models/Mistral-7B-Instruct-v0.3/,enable_chunked:False,max_num_batched_tokens:32768,vllm_share:False
+prompt_num share_degree     time throughput
+////////////////////////////
+ 2024-12-23 02:10:49.702796 vllm performace test
+nvidia,12.4
+engine_path:/workspace/models/Mistral-7B-Instruct-v0.3/,enable_chunked:False,max_num_batched_tokens:32768,vllm_share:False
+prompt_num share_degree     time throughput

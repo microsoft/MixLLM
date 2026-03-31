@@ -1,0 +1,838 @@
+"""Attention backend utils"""
+from collections import defaultdict
+from contextlib import contextmanager
+from itertools import accumulate
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Type, TypeVar, Union, Optional
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from vllm.attention import (AttentionMetadata, AttentionMetadataBuilder,
+                            AttentionState)
+from vllm.attention.backends.abstract import AttentionType
+from vllm.multimodal import MultiModalPlaceholderMap
+from vllm.utils import async_tensor_h2d, make_tensor_with_pad
+from vllm.forward_context import set_forward_context
+
+if TYPE_CHECKING:
+    from vllm.worker.model_runner_base import ModelRunnerBase
+
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+# Error string(s) for encoder/decoder
+# unsupported attention scenarios
+STR_NOT_IMPL_ENC_DEC_ROCM_HIP = ("ROCm/HIP is not currently supported "
+                                 "with encoder/decoder models.")
+
+PAD_SLOT_ID = -1
+
+# Switch to numpy implementation of compute_slot_mapping
+# if we have at least this many elements. Could be tuned further.
+_COMPUTE_SLOT_MAPPING_NUMPY_NUMEL = 256
+
+if TYPE_CHECKING:
+    from vllm.worker.model_runner import ModelInputForGPUBuilder
+
+
+def is_block_tables_empty(block_tables: Union[None, Dict]):
+    """
+    Check if block_tables is None or a dictionary with all None values.
+    """
+    if block_tables is None:
+        return True
+    return (isinstance(block_tables, dict)
+            and all(value is None for value in block_tables.values()))
+
+
+def compute_slot_mapping_start_idx(is_prompt: bool, query_len: int,
+                                   context_len: int, sliding_window: int):
+    """
+    Compute the start index of slot mapping.
+    """
+    start_idx = 0
+    if is_prompt and sliding_window is not None:
+        start_idx = max(0, query_len - sliding_window)
+    return start_idx
+
+
+def _compute_slot_mapping_python(slot_mapping: List[int],
+                                 block_table: List[int], range_start: int,
+                                 range_end: int, block_size: int,
+                                 batchllm_block_offs: int = 0,
+                                 batchllm_index_offs: int = 0
+                                 ):
+    for i in range(range_start, range_end):
+        block_number = block_table[batchllm_block_offs + (i - batchllm_index_offs) // block_size]
+        block_offset = (i - batchllm_index_offs) % block_size
+        slot = block_number * block_size + block_offset
+        slot_mapping.append(slot)
+
+
+def _compute_slot_mapping_numpy(slot_mapping: List[int],
+                                block_table: List[int], range_start: int,
+                                range_end: int, block_size: int,
+                                batchllm_block_offs: int = 0,
+                                batchllm_index_offs: int = 0, # TODO(batchllm): check if it's right
+                                ):
+    block_table_array = np.array(block_table)
+    idx = np.arange(range_start, range_end)
+    block_offset = (idx - batchllm_index_offs) % block_size
+    idx = batchllm_block_offs + (idx - batchllm_index_offs) // block_size
+    seq_slot_mapping_array = block_table_array[idx]
+    seq_slot_mapping_array *= block_size
+    seq_slot_mapping_array += block_offset
+    slot_mapping.extend(seq_slot_mapping_array)
+
+
+
+def compute_slot_mapping(is_profile_run: bool, slot_mapping: List[int],
+                         seq_id: int, seq_len: int, context_len: int,
+                         start_idx: int, block_size: int,
+                         block_tables: Dict[int, List[int]],
+                         batchllm_meta_collect: bool = False,
+                         batchllm_this_group_hit: bool = False,
+                         batchllm_common_kv_len: int = 0,
+                         batchllm_common_kv_block_count: int = 0,
+                         ):
+    """
+    Compute slot mapping.
+    """
+    if is_profile_run:
+        # During memory profiling, the block tables are not
+        # initialized yet. In this case, we just use a dummy
+        # slot mapping.
+        # In embeddings, the block tables are {seq_id: None}.
+        slot_mapping.extend([PAD_SLOT_ID] * seq_len)
+        return
+
+    # Mask the [0, start_idx) tokens of the prompt with
+    # PAD_SLOT_ID, where start_idx is max(0, seq_len -
+    # sliding_window). For example, if the prompt len is 10,
+    # sliding window is 8, and block size is 4, the first two
+    # tokens are masked and the slot mapping will be
+    # [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+    padding_mask_len = max(0, start_idx - context_len)
+    slot_mapping.extend([PAD_SLOT_ID] * padding_mask_len)
+
+    range_start = max(start_idx, context_len)
+    range_end = seq_len + batchllm_common_kv_len
+    numel = range_end - range_start
+    block_table = block_tables[seq_id]
+
+    # Since one request is split as common and distinct part in
+    # batchllm, slot_mapping  needs to be fix here.
+    batchllm_block_offs = 0
+    batchllm_index_offs = 0
+    if batchllm_meta_collect and batchllm_this_group_hit:
+        batchllm_block_offs = batchllm_common_kv_block_count
+        batchllm_index_offs = batchllm_common_kv_len
+
+    # numpy implementation will be faster than python if we have
+    # many elements, otherwise it will be slower.
+    if numel < _COMPUTE_SLOT_MAPPING_NUMPY_NUMEL:
+        _compute_slot_mapping_python(slot_mapping, block_table, range_start,
+                                     range_end, block_size, batchllm_block_offs, batchllm_index_offs)
+    else:
+        _compute_slot_mapping_numpy(slot_mapping, block_table, range_start,
+                                    range_end, block_size,batchllm_block_offs, batchllm_index_offs)
+
+
+TAttentionMetadata = TypeVar("TAttentionMetadata", bound='AttentionMetadata')
+
+
+class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
+
+    _metadata_cls: Type[TAttentionMetadata]
+
+    def __init__(self, input_builder: "ModelInputForGPUBuilder"):
+        self.slot_mapping: List[int] = []
+        self.prefill_seq_lens: List[int] = []
+        self.context_lens: List[int] = []
+        self.block_tables: List[List[int]] = []
+        self.curr_seq_lens: List[int] = []
+        self.multimodal_placeholder_maps: Dict[
+            str,
+            MultiModalPlaceholderMap] = defaultdict(MultiModalPlaceholderMap)
+        self.num_prefills = 0
+        self.num_prefill_tokens = 0
+        self.num_decode_tokens = 0
+
+        self.input_builder = input_builder
+        self.runner = input_builder.runner
+
+        self.sliding_window = input_builder.sliding_window
+        self.block_size = input_builder.block_size
+
+    def _add_seq_group(
+            self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
+            chunked_prefill_enabled: bool):
+        is_prompt = inter_data.is_prompt
+        block_tables = inter_data.block_tables
+
+        for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
+             curr_sliding_window_block) in zip(
+                 inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
+                 inter_data.orig_seq_lens, inter_data.seq_lens,
+                 inter_data.query_lens, inter_data.context_lens,
+                 inter_data.curr_sliding_window_blocks):
+            self.context_lens.append(context_len)
+            if is_prompt:
+                mm_maps = inter_data.multi_modal_placeholder_maps
+                if mm_maps:
+                    for modality, placeholders in mm_maps.items():
+                        self.multimodal_placeholder_maps[modality].extend(
+                            placeholders)
+
+                self.num_prefills += 1
+                self.num_prefill_tokens += token_len
+                self.prefill_seq_lens.append(seq_len)
+            else:
+                assert query_len == 1, (
+                    "seq_len: {}, context_len: {}, query_len: {}".format(
+                        seq_len, context_len, query_len))
+                self.num_decode_tokens += query_len
+                self.curr_seq_lens.append(curr_seq_len)
+
+            # Compute block table.
+            # TODO(sang): Combine chunked prefill and prefix caching by
+            # only allowing multiple of block_size chunk size.
+            # NOTE: This only works for oooooooxxx style attention.
+            block_table = []
+            if inter_data.prefix_cache_hit:
+                block_table = block_tables[seq_id]
+            elif ((chunked_prefill_enabled or not is_prompt)
+                  and block_tables is not None):
+                if curr_sliding_window_block == 0:
+                    block_table = block_tables[seq_id]
+                else:
+                    block_table = block_tables[seq_id][
+                        -curr_sliding_window_block:]
+            self.block_tables.append(block_table)
+
+            # Compute slot mapping.
+            is_profile_run = is_block_tables_empty(block_tables)
+            start_idx = compute_slot_mapping_start_idx(is_prompt, query_len,
+                                                       context_len,
+                                                       self.sliding_window)
+            compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
+                                 seq_len, context_len, start_idx,
+                                 self.block_size, inter_data.block_tables)
+
+    def build(self, seq_lens: List[int], query_lens: List[int],
+              cuda_graph_pad_size: int, batch_size: int):
+        """Build attention metadata with on-device tensors.
+
+        Args:
+            seq_lens: The maybe padded sequence lengths of the input sequences.
+            query_lens: The query lengths of the input sequences.
+            cuda_graph_pad_size: The padding size for cuda graph.
+                                 -1 if cuda graph is not used.
+            batch_size: The maybe padded batch size.
+        """
+        for inter_data in self.input_builder.inter_data_list:
+            self._add_seq_group(inter_data,
+                                self.input_builder.chunked_prefill_enabled)
+
+        device = self.runner.device
+        use_captured_graph = cuda_graph_pad_size != -1
+
+        max_query_len = max(query_lens)
+        max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
+        max_decode_seq_len = max(self.curr_seq_lens, default=0)
+        num_decode_tokens = self.num_decode_tokens
+        query_start_loc = list(accumulate(query_lens, initial=0))
+        seq_start_loc = list(accumulate(seq_lens, initial=0))
+
+        if use_captured_graph:
+            self.slot_mapping.extend([PAD_SLOT_ID] * cuda_graph_pad_size)
+            self.block_tables.extend([] * cuda_graph_pad_size)
+            num_decode_tokens = batch_size
+
+            # The shape of graph_block_tables is
+            # [max batch size, max context len // block size].
+            input_block_tables = self.runner.graph_block_tables[:batch_size]
+            for i, block_table in enumerate(self.block_tables):
+                if block_table:
+                    input_block_tables[i, :len(block_table)] = block_table
+            block_tables = torch.from_numpy(input_block_tables).to(
+                device, non_blocking=True)
+        else:
+            block_tables = make_tensor_with_pad(
+                self.block_tables,
+                pad=0,
+                dtype=torch.int,
+                device=device,
+            )
+        assert max_query_len > 0, "query_lens: {}".format(query_lens)
+
+        assert device is not None
+        context_lens_tensor = async_tensor_h2d(self.context_lens, torch.int,
+                                               device, self.runner.pin_memory)
+        seq_lens_tensor = async_tensor_h2d(seq_lens, torch.int, device,
+                                           self.runner.pin_memory)
+        slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
+                                               device, self.runner.pin_memory)
+        query_start_loc_tensor = async_tensor_h2d(query_start_loc, torch.int32,
+                                                  device,
+                                                  self.runner.pin_memory)
+        seq_start_loc_tensor = async_tensor_h2d(seq_start_loc, torch.int32,
+                                                device, self.runner.pin_memory)
+        placeholder_index_maps = {
+            modality: placeholder_map.index_map()
+            for modality, placeholder_map in
+            self.multimodal_placeholder_maps.items()
+        }
+
+        return self._metadata_cls(  # type: ignore
+            num_prefills=self.num_prefills,
+            slot_mapping=slot_mapping_tensor,
+            multi_modal_placeholder_index_maps=placeholder_index_maps,
+            num_prefill_tokens=self.num_prefill_tokens,
+            num_decode_tokens=num_decode_tokens,
+            seq_lens=seq_lens,
+            seq_lens_tensor=seq_lens_tensor,
+            max_query_len=max_query_len,
+            max_prefill_seq_len=max_prefill_seq_len,
+            max_decode_seq_len=max_decode_seq_len,
+            query_start_loc=query_start_loc_tensor,
+            seq_start_loc=seq_start_loc_tensor,
+            context_lens_tensor=context_lens_tensor,
+            block_tables=block_tables,
+            use_cuda_graph=use_captured_graph,
+        )
+
+
+class CommonAttentionState(AttentionState):
+
+    def __init__(self, runner: "ModelRunnerBase"):
+        self.runner = runner
+        self._is_graph_capturing = False
+
+    @contextmanager
+    def graph_capture(self, max_batch_size: int):
+        self._is_graph_capturing = True
+        self._graph_slot_mapping = torch.full((max_batch_size, ),
+                                              PAD_SLOT_ID,
+                                              dtype=torch.long,
+                                              device=self.runner.device)
+        self._graph_seq_lens = torch.ones(max_batch_size,
+                                          dtype=torch.int32,
+                                          device=self.runner.device)
+        self._graph_block_tables = torch.from_numpy(
+            self.runner.graph_block_tables).to(device=self.runner.device)
+        yield
+        self._is_graph_capturing = False
+        del self._graph_slot_mapping
+        del self._graph_seq_lens
+        del self._graph_block_tables
+
+    def graph_clone(self, batch_size: int) -> "CommonAttentionState":
+        assert self._is_graph_capturing
+        return self.__class__(self.runner)
+
+    def graph_capture_get_metadata_for_batch(
+            self, batch_size: int, is_encoder_decoder_model: bool = False):
+        assert self._is_graph_capturing
+        attn_metadata = self.runner.attn_backend.make_metadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decode_tokens=batch_size,
+            slot_mapping=self._graph_slot_mapping[:batch_size],
+            multi_modal_placeholder_index_maps=None,
+            seq_lens=None,
+            seq_lens_tensor=self._graph_seq_lens[:batch_size],
+            max_query_len=1,
+            max_decode_query_len=1,
+            max_prefill_seq_len=0,
+            max_decode_seq_len=self.runner.max_seq_len_to_capture,
+            query_start_loc=None,
+            seq_start_loc=None,
+            context_lens_tensor=None,
+            block_tables=self._graph_block_tables[:batch_size],
+            use_cuda_graph=True,
+        )
+        if is_encoder_decoder_model:
+            # The encoder decoder model works only with XFormers and
+            # Flash Attention backend. Assert the same.
+            assert self.runner.attn_backend.get_name() in\
+                ["XFORMERS", "FLASH_ATTN"], \
+                f"Expected attn_backend name to be either 'XFORMERS' or " \
+                f"'FLASH_ATTN', but "\
+                f"got '{self.runner.attn_backend.get_name()}'"
+            self._update_captured_metadata_for_enc_dec_model(
+                batch_size=batch_size, attn_metadata=attn_metadata)
+
+        return attn_metadata
+
+    def get_graph_input_buffers(
+            self,
+            attn_metadata,
+            is_encoder_decoder_model: bool = False) -> Dict[str, Any]:
+        input_buffers = {
+            "slot_mapping": attn_metadata.slot_mapping,
+            "seq_lens_tensor": attn_metadata.decode_metadata.seq_lens_tensor,
+            "block_tables": attn_metadata.decode_metadata.block_tables,
+        }
+        if is_encoder_decoder_model:
+            # The encoder decoder model works only with XFormers and
+            # Flash Attention backend. Assert the same.
+            assert self.runner.attn_backend.get_name() in\
+                ["XFORMERS", "FLASH_ATTN"], \
+                f"Expected attn_backend name to be either 'XFORMERS' or "\
+                f"'FLASH_ATTN', but "\
+                f"got '{self.runner.attn_backend.get_name()}'"
+            self._add_additonal_input_buffers_for_enc_dec_model(
+                attn_metadata=attn_metadata, input_buffers=input_buffers)
+        return input_buffers
+
+    def prepare_graph_input_buffers(
+            self,
+            input_buffers,
+            attn_metadata,
+            is_encoder_decoder_model: bool = False) -> None:
+        input_buffers["seq_lens_tensor"].copy_(
+            attn_metadata.decode_metadata.seq_lens_tensor, non_blocking=True)
+        input_buffers["block_tables"].copy_(
+            attn_metadata.decode_metadata.block_tables, non_blocking=True)
+        if is_encoder_decoder_model:
+            # The encoder decoder model works only with XFormers and
+            # Flash Attention backend. Assert the same.
+            assert self.runner.attn_backend.get_name() in\
+                ["XFORMERS", "FLASH_ATTN"], \
+                f"Expected attn_backend name to be either 'XFORMERS' or "\
+                f"'FLASH_ATTN', but "\
+                f"got '{self.runner.attn_backend.get_name()}'"
+            self._prepare_input_buffers_for_enc_dec_model(
+                attn_metadata, input_buffers)
+
+    def begin_forward(self, model_input) -> None:
+        return
+
+    def _update_captured_metadata_for_enc_dec_model(self, batch_size: int,
+                                                    attn_metadata):
+        """
+        Updates the attention metadata parameters for CUDA graph capture in an
+        encoder-decoder model.
+
+        This method modifies attention-related tensors and metadata required
+        for CUDA graph capture in encoder-decoder models. Specifically, it
+        updates the cross-attention and encoder sequence tensors in the 
+        AttentionMetadata object.
+        """
+        # During decode phase the cross_slot_mapping will be empty. Hence set
+        # an empty tensor for CUDA Graph capture.
+        attn_metadata.cross_slot_mapping = torch.tensor(
+            [], dtype=torch.int).cuda()
+        attn_metadata.cross_block_tables = torch.full(
+            (batch_size, self.runner.get_max_block_per_batch()),
+            1,
+            dtype=torch.int).cuda()
+        attn_metadata.encoder_seq_lens = torch.full((batch_size, ),
+                                                    1,
+                                                    dtype=torch.int).cuda()
+        attn_metadata.encoder_seq_lens_tensor = torch.full(
+            (batch_size, ), 1, dtype=torch.int).cuda()
+        attn_metadata.max_encoder_seq_len = self.runner.max_seq_len_to_capture
+        attn_metadata.num_encoder_tokens = 0
+
+    def _add_additonal_input_buffers_for_enc_dec_model(
+            self, attn_metadata, input_buffers: Dict[str, Any]):
+        """
+        Saves additional input buffers specific to the encoder-decoder model
+        from the attention metadata.
+
+        This method extracts and stores encoder-decoder related input buffers
+        from the `attn_metadata` into the `input_buffers` dictionary. The
+        buffers include encoder sequence lengths, cross-slot mappings, and
+        cross-block tables, which are essential for the encoder-decoder model
+        during CUDA graph replay.
+        """
+        input_buffers["encoder_seq_lens_tensor"] = (
+            attn_metadata.decode_metadata.encoder_seq_lens_tensor)
+        input_buffers["cross_slot_mapping"] = (
+            attn_metadata.decode_metadata.cross_slot_mapping)
+        input_buffers["cross_block_tables"] = (
+            attn_metadata.decode_metadata.cross_block_tables)
+
+    def _prepare_input_buffers_for_enc_dec_model(self, attn_metadata,
+                                                 input_buffers: Dict[str,
+                                                                     Any]):
+        """
+        Populates input buffers with data from the encoder-decoder model's
+        attention metadata.
+
+        This method fills the input buffers with encoder-decoder specific
+        tensors. It copies data from the `attn_metadata` and keyword arguments
+        (`kwargs`) into corresponding buffers in the `input_buffers` dictionary.
+        The copied data includes attention-related metadata as well as input 
+        IDs and positional information for the encoder.
+        """
+        input_buffers["encoder_seq_lens_tensor"].copy_(
+            attn_metadata.decode_metadata.encoder_seq_lens_tensor,
+            non_blocking=True)
+        input_buffers["cross_slot_mapping"].copy_(
+            attn_metadata.decode_metadata.cross_slot_mapping,
+            non_blocking=True)
+        input_buffers["cross_block_tables"].copy_(
+            attn_metadata.decode_metadata.cross_block_tables,
+            non_blocking=True)
+
+
+def is_all_encoder_attn_metadata_set(attn_metadata):
+    '''
+    All attention metadata required for encoder attention is set.
+    '''
+    return ((attn_metadata.encoder_seq_lens is not None)
+            and (attn_metadata.encoder_seq_lens_tensor is not None)
+            and (attn_metadata.max_encoder_seq_len is not None))
+
+
+def is_all_cross_attn_metadata_set(attn_metadata):
+    '''
+    All attention metadata required for enc/dec cross-attention is set.
+
+    Superset of encoder attention required metadata.
+    '''
+    return (attn_metadata.is_all_encoder_attn_metadata_set
+            and (attn_metadata.cross_slot_mapping is not None)
+            and (attn_metadata.cross_block_tables is not None))
+
+
+def get_seq_len_block_table_args(
+    attn_metadata,
+    is_prompt: bool,
+    attn_type: AttentionType,
+) -> tuple:
+    '''
+    The particular choice of sequence-length- and block-table-related
+    attributes which should be extracted from attn_metadata is dependent
+    on the type of attention operation.
+
+    Decoder attn -> select entirely decoder self-attention-related fields
+    Encoder/decoder cross-attn -> select encoder sequence lengths & 
+                                  cross-attn block-tables fields
+    Encoder attn -> select encoder sequence lengths fields & no block tables
+    
+    Arguments:
+
+    * attn_metadata: Attention metadata structure associated with attention op
+    * is_prompt: True if prefill, False otherwise
+    * attn_type: encoder attention, decoder self-attention,
+                 encoder/decoder cross-attention
+
+    Returns:
+
+    * Appropriate sequence-lengths tensor
+    * Appropriate max sequence-length scalar
+    * Appropriate block tables (or None)
+    '''
+
+    if attn_type == AttentionType.DECODER:
+        # Decoder self-attention
+        # Choose max_seq_len based on whether we are in prompt_run
+        if is_prompt:
+            max_seq_len = attn_metadata.max_prefill_seq_len
+        else:
+            max_seq_len = attn_metadata.max_decode_seq_len
+        return (attn_metadata.seq_lens_tensor, max_seq_len,
+                attn_metadata.block_tables)
+    elif attn_type == AttentionType.ENCODER_DECODER:
+        # Enc/dec cross-attention KVs match encoder sequence length;
+        # cross-attention utilizes special "cross" block tables
+        return (attn_metadata.encoder_seq_lens_tensor,
+                attn_metadata.max_encoder_seq_len,
+                attn_metadata.cross_block_tables)
+    elif attn_type == AttentionType.ENCODER:
+        # No block tables associated with encoder attention
+        return (attn_metadata.encoder_seq_lens_tensor,
+                attn_metadata.max_encoder_seq_len, None)
+    else:
+        raise AttributeError(f"Invalid attention type {str(attn_type)}")
+
+
+
+def get_num_prefill_decode_query_kv_tokens(
+    attn_metadata,
+    attn_type: AttentionType,
+) -> Tuple[int, int, int]:
+    """
+    Calculate the number of prefill and decode tokens for query, key/value
+    based on the attention metadata and the specified attention type.
+
+    Args:
+        attn_metadata (FlashAttentionMetadata): Attention Metadata object.
+        attn_type (AttentionType): The type of attention being used.
+    Returns:
+        Tuple[int, int, int]: A tuple containing three integers:
+            - The number of prefill query tokens.
+            - The number of prefill key/value tokens.
+            - The number of decode query tokens.
+
+    Raises:
+        AssertionError: If the number of encoder tokens in `attn_metadata` 
+        is `None` when required for the calculations.
+    """
+    num_prefill_query_tokens = 0
+    num_decode_query_tokens = 0
+    num_prefill_kv_tokens = 0
+    if attn_type == AttentionType.ENCODER:
+        # Encoder attention is only invoked during prefill phase.
+        # The same input servers a both query and key.
+        assert attn_metadata.num_encoder_tokens is not None
+        num_prefill_query_tokens = attn_metadata.num_encoder_tokens
+        num_prefill_kv_tokens = attn_metadata.num_encoder_tokens
+        num_decode_query_tokens = 0
+    elif attn_type == AttentionType.ENCODER_DECODER:
+        assert attn_metadata.num_encoder_tokens is not None
+        num_prefill_query_tokens = attn_metadata.num_prefill_tokens
+        # The key is the encoder/cross-attention.
+        num_prefill_kv_tokens = attn_metadata.num_encoder_tokens
+        num_decode_query_tokens = attn_metadata.num_decode_tokens
+    else:  # attn_type == AttentionType.DECODER or
+        # attn_type == AttentionType.ENCODER_ONLY
+        num_prefill_query_tokens = attn_metadata.num_prefill_tokens
+        num_prefill_kv_tokens = attn_metadata.num_prefill_tokens
+        num_decode_query_tokens = attn_metadata.num_decode_tokens
+
+    return (num_prefill_query_tokens, num_prefill_kv_tokens,
+            num_decode_query_tokens)
+
+
+@dataclass
+class ContextSharingMeta:
+    """
+    This class is used to store the context sharing meta information
+    """
+
+    # NOTE: in the new version of Context_sharing,
+    # we concat the query_len/kv_len/query_start_loc of request/group together
+
+    # size: [3, request_num + group_num]
+    # [0,:]: query_len, in request-level & group-level
+    # [1,:]: kv_length in one ragged batch, in request-level & group-level
+    # [2,:]: query_start_location in one ragged batch, in request-level & group-leve
+    context_share_meta_tensor : Optional[torch.Tensor] = None
+    # kv block_table in one ragged batch, [request_num + group_num, max_blocks_num]
+    context_share_kv_list_tensor: Optional[torch.Tensor] = None
+
+    # FIXME(batchllm): use another tensor to record the group query_len ande the group start location.
+    red_query_tensor :  Optional[torch.Tensor] = None
+    max_group_q_len: Optional[int] = None
+    max_request_q_len: Optional[int] = None
+    max_group_kv_len: Optional[int] = None
+    max_request_kv_len: Optional[int] = None
+    group_num: Optional[int] = None
+    request_num: Optional[int] = None
+
+    # there're some cases where 'context_sharing' is not good.
+    # Thus we use vanilla attention when it comes to these cases,
+    # with the following masks.
+    masked_seq_lens: Optional[List[int]] = None
+    masked_seq_lens_tensor: Optional[torch.Tensor] = None
+    max_mask_seq_len: Optional[int] = None
+    # For the `jit` of triton.
+    warmup: bool = False
+
+@torch.inference_mode()
+def warmup_batchllm(model_runner, kv_caches: List[List[torch.Tensor]]) -> None:
+    # TODO(batchllm): here or under "backends"?
+    """ModelRunner Triton Kernel Warmup.
+        As the kernels in `context_sharing` take some input that maybe divisible by 16(de) or 8(d),
+        which take some time to be compiled.
+    """
+    if model_runner.attn_backend.get_name() != "BATCH_LLM" and model_runner.attn_backend.get_name() != "ROCM_BATCH_LLM":
+        logger.info("NO Warm-up for kernels except cuda")
+        return
+    logger.info("Warming up the kernels for BatchLLM, which may take 1-3 minutes.")
+
+    max_batch_size = 513
+    BLOCK_M = 8
+    max_request_count = 300  #
+    max_group_count = 3
+
+    input_tokens = torch.zeros(max_batch_size, dtype=torch.long).cuda()
+    input_positions = torch.zeros(max_batch_size, dtype=torch.long).cuda()
+    slot_mapping = torch.empty(max_batch_size, dtype=torch.long).cuda()
+    slot_mapping.fill_(-1)
+    masked_decoding_seq_lens_tensor_total = torch.zeros(max_request_count, dtype=torch.int32).cuda()
+
+    # NOT USED
+
+    intermediate_inputs = None
+    context_share_kv_list_tensor_cpu = torch.from_numpy(model_runner.graph_request_block_tables)
+    # ragged_batch:
+    # prefill: 2*BLOCK_M+2, 1, 1, as 3 single groups
+    # decoding: 2*BLOCK_M+2, 1, 1 as 3 single groups
+
+    for prefill in [True, False]:
+        for stride_kv_list in [3]:
+            # NOTE(xinji1): since the maximum of "group + batch" in the warm-up stage is 48 (32+16)
+            # the max_size of context_sharing_kv_block_table is `(48, 16)`
+            max_kv_length = (stride_kv_list - 1) * model_runner.block_size + 2
+            context_share_kv_lens = [max_kv_length] + [1] * (max(max_request_count, max_group_count) - 1)
+
+            # TODO(xinji1): Optimization for the meta-info tensor, [3 , batch+ group] -> [batch+group, 3] ? or [group + batch, 3]
+            for max_group_tiling in [3]:
+                max_group_q_len = (max_group_tiling - 1) * BLOCK_M + 2
+                context_share_group_q_lens = [max_group_q_len] + [1] * (max(max_request_count, max_group_count) - 1)
+                context_share_group_q_start_loc = [0] + [max_group_q_len + i for i in
+                                                         range(0, (max(max_request_count, max_group_count) - 1))]
+
+                p_max_request_q_len = max_group_q_len
+                p_context_share_request_q_lens = [p_max_request_q_len] + [1] * (
+                        max(max_request_count, max_group_count) - 1)
+                p_context_share_request_q_start_loc = [0] + [p_max_request_q_len + i for i in range(0, (
+                        max(max_request_count, max_group_count) - 1))]
+
+                d_max_request_q_len = 1
+                d_context_share_request_q_lens = [d_max_request_q_len] + [1] * (
+                        max(max_request_count, max_group_count) - 1)
+                d_context_share_request_q_start_loc = [0] + [d_max_request_q_len + i for i in range(0, (
+                        max(max_request_count, max_group_count) - 1))]
+
+                context_share_q_lens_tensor_raw = torch.tensor(p_context_share_request_q_lens,
+                                                               dtype=torch.int32).cuda()
+                context_share_q_start_loc_tensor_raw = torch.tensor(p_context_share_request_q_start_loc,
+                                                                    dtype=torch.int32).cuda()
+
+                for group_num in [3]:
+                    # for prefill_stage, request_num ==3 too
+                    p_context_share_meta_tensor = torch.tensor([
+                        p_context_share_request_q_lens[:group_num] + p_context_share_request_q_lens[:group_num],
+                        context_share_kv_lens[:group_num * 2],
+                        p_context_share_request_q_start_loc[:group_num] + p_context_share_request_q_start_loc[
+                                                                          :group_num],
+                    ], dtype=torch.int32).cuda()
+                    p_context_share_kv_list_tensor = context_share_kv_list_tensor_cpu[:group_num * 2,
+                                                     :stride_kv_list].contiguous().cuda()
+                    # for decoding stage, request_num = (max_group_q_len) + 2
+                    d_context_share_meta_tensor = []
+                    d_context_share_kv_list_tensor = []
+                    d_context_share_meta_tensor = torch.tensor([
+                        d_context_share_request_q_lens[:max_group_q_len + 2] + p_context_share_request_q_lens[
+                                                                               :group_num],
+                        context_share_kv_lens[:(max_group_q_len + 2 + group_num)],
+                        d_context_share_request_q_start_loc[
+                        :max_group_q_len + 2] + p_context_share_request_q_start_loc[:group_num],
+                    ], dtype=torch.int32).cuda()
+                    d_context_share_kv_list_tensor = context_share_kv_list_tensor_cpu[
+                                                     :(max_group_q_len + 2 + group_num),
+                                                     :stride_kv_list].contiguous().cuda()
+                    red_p_tensor = torch.tensor(
+                        [
+                            p_context_share_request_q_lens[:group_num],
+                            p_context_share_request_q_start_loc[:group_num]
+                        ], dtype=torch.int32).cuda()
+                    red_d_tensor = torch.tensor(
+                        [
+                            p_context_share_request_q_lens[:group_num],
+                            p_context_share_request_q_start_loc[:group_num],
+                        ], dtype=torch.int32).cuda()
+
+                    # stack them together
+                    temp = p_context_share_request_q_start_loc[:group_num]
+                    temp = [x + max_group_q_len + 2 for x in temp]
+                    red_pd_tensor = torch.tensor(
+                        [
+                            p_context_share_request_q_lens[:group_num] + p_context_share_request_q_lens[:group_num],
+                            p_context_share_request_q_start_loc[:group_num] + temp,
+                        ], dtype=torch.int32).cuda()
+                    prefill_context_sharing_meta = ContextSharingMeta(
+                        context_share_meta_tensor=p_context_share_meta_tensor,
+                        context_share_kv_list_tensor=p_context_share_kv_list_tensor,
+                        max_group_q_len=max_group_q_len,
+                        max_request_q_len=max_group_q_len,
+                        group_num=group_num,
+                        request_num=group_num,
+                        red_query_tensor=red_p_tensor,
+
+                    )
+                    masked_decoding_seq_lens = [0] * (max_group_q_len + 2)
+                    max_mask_seq_len = 0
+                    masked_decoding_seq_lens_tensor = masked_decoding_seq_lens_tensor_total[:max_group_q_len + 2]
+                    decoding_context_sharing_meta = ContextSharingMeta(
+                        context_share_meta_tensor=d_context_share_meta_tensor,
+                        context_share_kv_list_tensor=d_context_share_kv_list_tensor,
+                        max_group_q_len=max_group_q_len,
+                        max_request_q_len=1,
+                        group_num=group_num,
+                        request_num=max_group_q_len + 2,
+                        masked_seq_lens=masked_decoding_seq_lens,
+                        masked_seq_lens_tensor=masked_decoding_seq_lens_tensor,
+                        max_mask_seq_len=max_mask_seq_len,
+                        red_query_tensor=red_d_tensor,
+                    )
+
+                    kwargs_cs = {}
+                    kwargs_cs["decoding_context_sharing_meta"] = decoding_context_sharing_meta
+                    num_tokens = max_group_q_len + 2
+                    batch = num_tokens
+                    attn_metadata = model_runner.attn_backend.make_metadata(
+                        num_prefills=0,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=num_tokens,
+                        slot_mapping=slot_mapping[:num_tokens],
+                        multi_modal_placeholder_index_maps=None,
+                        # flash_attn meta
+                        seq_lens=context_share_q_lens_tensor_raw[:num_tokens],
+                        seq_lens_tensor=context_share_q_start_loc_tensor_raw[:num_tokens],
+                        max_prefill_seq_len=0,
+                        max_decode_seq_len=0,
+                        context_lens_tensor=d_context_share_kv_list_tensor[:batch],
+                        block_tables=d_context_share_kv_list_tensor[:batch],
+                        use_cuda_graph=False,
+                        max_query_len=1,
+                        max_decode_query_len=1,
+                        query_start_loc=context_share_q_start_loc_tensor_raw[:batch],
+                        seq_start_loc=context_share_q_start_loc_tensor_raw[:batch],
+                        decoding_group_activated=True,
+                        **kwargs_cs,
+                    )
+
+                    # print(f"prefill, group_num {prefill}, {group_num} {context_share_meta_tensor.size()}")
+                    with set_forward_context(attn_metadata):
+                        for _ in range(1):
+                            model_runner.model(
+                                input_tokens[:num_tokens],
+                                input_positions[:num_tokens],
+                                kv_caches[0],
+                                attn_metadata,
+                                intermediate_inputs,
+                            )
+
+                    kwargs_cs = {}
+                    kwargs_cs["prefill_context_sharing_meta"] = prefill_context_sharing_meta
+                    num_tokens = max_group_q_len + 2
+                    attn_metadata = model_runner.attn_backend.make_metadata(
+                        num_prefills=group_num,
+                        num_prefill_tokens=num_tokens,
+                        num_decode_tokens=0,
+                        slot_mapping=slot_mapping[:num_tokens],
+                        multi_modal_placeholder_index_maps=None,
+                        # flash_attn meta
+                        seq_lens=context_share_group_q_lens[:group_num],
+                        seq_lens_tensor=context_share_q_lens_tensor_raw[:group_num],
+                        max_prefill_seq_len=0,
+                        max_decode_seq_len=0,
+                        context_lens_tensor=p_context_share_kv_list_tensor[:group_num],
+                        block_tables=p_context_share_kv_list_tensor[:group_num],
+                        use_cuda_graph=False,
+                        max_query_len=max_group_q_len,
+                        max_decode_query_len=None,
+                        query_start_loc=context_share_q_start_loc_tensor_raw[:group_num],
+                        seq_start_loc=context_share_q_start_loc_tensor_raw[:group_num],
+                        prefill_group_activated=True,
+                        **kwargs_cs,
+                    )
+                    with set_forward_context(attn_metadata):
+                        for _ in range(1):
+                            model_runner.model(
+                                input_tokens[:num_tokens],
+                                input_positions[:num_tokens],
+                                kv_caches[0],
+                                attn_metadata,
+                                intermediate_inputs,
+                            )
+    torch.cuda.synchronize()
